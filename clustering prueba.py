@@ -13,7 +13,7 @@ from river import stream
 data = fetch_california_housing(as_frame=True)
 df = data.frame
 target_name = 'MedHouseVal' 
-n_clusters = 2
+n_clusters = 4
 seed_value = 1
 
 # Usaremos TODAS las columnas (incluyendo MedHouseVal) para el clustering.
@@ -22,18 +22,18 @@ X_river_format = X_df.to_dict(orient='records')
 
 # --- 2. DEFINICIÓN Y ENTRENAMIENTO DEL PIPELINE (RIVER) ---
 
-# model_clustering = (
-#     preprocessing.StandardScaler() |
-#     cluster.KMeans(n_clusters=n_clusters, seed=seed_value)
-# )
 model_clustering = (
     preprocessing.StandardScaler() |
-    cluster.DenStream(
-        beta=0.2,       
-        mu=8,           # Aumentado de 6 a 8 (mayor estrictez)
-        epsilon=0.02,   # Duplicado de 0.01 a 0.02 (mayor radio de clúster)
-    )
+    cluster.KMeans(n_clusters=n_clusters, seed=seed_value)
 )
+# model_clustering = (
+#     preprocessing.StandardScaler() |
+#     cluster.DenStream(
+#         beta=0.2,       
+#         mu=8,           # Aumentado de 6 a 8 (mayor estrictez)
+#         epsilon=0.02,   # Duplicado de 0.01 a 0.02 (mayor radio de clúster)
+#     )
+# )
 print("Iniciando el entrenamiento del modelo de clustering incremental (KMeans)...")
 
 cluster_labels = [] # Almacena las etiquetas de clúster asignadas por el modelo
