@@ -13,11 +13,17 @@ from river import stream
 data = fetch_california_housing(as_frame=True)
 df = data.frame
 target_name = 'MedHouseVal' 
-n_clusters = 4
-seed_value = 1
+n_clusters = 3
+seed_value = 42
 
-# Usaremos TODAS las columnas (incluyendo MedHouseVal) para el clustering.
-X_df = df.copy() 
+# **CORRECCIÓN: Excluir la variable objetivo para evitar data leakage**
+features = [col for col in df.columns if col != target_name]
+X_df = df[features].copy()  # Solo características, sin el target
+
+print("Características usadas para clustering:")
+print(features)
+print(f"\nDimensión de datos para clustering: {X_df.shape}")
+
 X_river_format = X_df.to_dict(orient='records') 
 
 # --- 2. DEFINICIÓN Y ENTRENAMIENTO DEL PIPELINE (RIVER) ---
@@ -26,14 +32,7 @@ model_clustering = (
     preprocessing.StandardScaler() |
     cluster.KMeans(n_clusters=n_clusters, seed=seed_value)
 )
-# model_clustering = (
-#     preprocessing.StandardScaler() |
-#     cluster.DenStream(
-#         beta=0.2,       
-#         mu=8,           # Aumentado de 6 a 8 (mayor estrictez)
-#         epsilon=0.02,   # Duplicado de 0.01 a 0.02 (mayor radio de clúster)
-#     )
-# )
+
 print("Iniciando el entrenamiento del modelo de clustering incremental (KMeans)...")
 
 cluster_labels = [] # Almacena las etiquetas de clúster asignadas por el modelo
@@ -46,13 +45,12 @@ for x_instance in X_river_format:
     # 2. Aprender (Actualizar el StandardScaler y los centroides de KMeans)
     model_clustering.learn_one(x_instance)
 
-print(f"Entrenamiento completado. Muestras procesadas: {len(df)}\n")
+print(f"Entrenamiento completado. Muestras procesadas: {len(X_df)}\n")
 cluster_labels = np.array(cluster_labels)
 
 # --- 3. CORRECCIÓN DEL PCA Y VISUALIZACIÓN DE CLÚSTERES (2D) ---
 
-## Paso 3.1: Aplicar el StandardScaler de River a todos los datos (CORRECCIÓN CLAVE)
-# ----------------------------------------------------------------------------------
+## Paso 3.1: Aplicar el StandardScaler de River a todos los datos
 river_scaler_instance = model_clustering['StandardScaler']
 
 # Transformar TODAS las características usando el scaler entrenado
@@ -81,7 +79,7 @@ scatter = plt.scatter(
     alpha=0.6
 )
 
-plt.title(f'Clustering KMeans (k={n_clusters}) en California Housing (Proyección PCA ESCALADA)')
+plt.title(f'Clustering KMeans (k={n_clusters}) en California Housing (SOLO CARACTERÍSTICAS)')
 plt.xlabel(f'Componente Principal 1 ({explained_variance_ratio_pc1:.2f}% de Varianza)')
 plt.ylabel(f'Componente Principal 2 ({explained_variance_ratio_pc2:.2f}% de Varianza)')
 
@@ -91,33 +89,44 @@ plt.gca().add_artist(legend1)
 plt.grid(True)
 plt.show()
 
-# --- 4. VISUALIZACIÓN COMPARATIVA (BOX PLOT DE LA VARIABLE OBJETIVO) ---
+# --- 4. ANÁLISIS DE LOS CLUSTERS ENCONTRADOS ---
 
-# Crear un DataFrame de comparación con la variable objetivo y las etiquetas de clúster
-comparison_df = pd.DataFrame({
-    target_name: df[target_name].values,
-    'Cluster': cluster_labels
-})
-comparison_df['Cluster'] = comparison_df['Cluster'].astype('category')
+# Crear DataFrame de análisis con características y clusters
+analysis_df = X_df.copy()
+analysis_df['Cluster'] = cluster_labels
+analysis_df['MedHouseVal'] = df[target_name].values  # Añadir target solo para análisis
 
-# Generar la gráfica Box Plot
+# --- 5. VISUALIZACIÓN COMPARATIVA (BOX PLOT DE LA VARIABLE OBJETIVO POR CLUSTER) ---
+
 plt.figure(figsize=(12, 6))
 
 sns.boxplot(
     x='Cluster', 
     y=target_name, 
-    data=comparison_df, 
+    data=analysis_df, 
     palette='viridis' 
 )
 
-# Etiquetas y Referencia
-plt.title(f'Distribución de {target_name} por Clúster')
+plt.title(f'Distribución de {target_name} por Clúster (Clustering basado solo en características)')
 plt.xlabel('ID del Clúster')
 plt.ylabel('Valor Mediano de la Vivienda (Cientos de miles de $)')
 plt.grid(axis='y', linestyle='--')
 
 global_median = df[target_name].median()
-plt.axhline(global_median, color='red', linestyle='dashed', linewidth=1, label=f'Mediana Global: {global_median:.2f}')
+plt.axhline(global_median, color='red', linestyle='dashed', linewidth=1, 
+           label=f'Mediana Global: {global_median:.2f}')
 plt.legend()
 
 plt.show()
+
+# --- 7. EVALUACIÓN DE LA CALIDAD DEL CLUSTERING ---
+
+from sklearn.metrics import silhouette_score
+
+# Calcular silhouette score (solo características)
+silhouette_avg = silhouette_score(X_scaled, cluster_labels)
+print(f"\n=== MÉTRICAS DE CALIDAD ===")
+print(f"Silhouette Score: {silhouette_avg:.3f}")
+print(f"Varianza explicada por PCA: {explained_variance_ratio_pc1 + explained_variance_ratio_pc2:.2f}%")
+print(f"Número de muestras por cluster:")
+print(analysis_df['Cluster'].value_counts().sort_index())
