@@ -1,133 +1,140 @@
+# Clustering incremental con River (simulación de flujo) + evaluación/visualización batch
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+
+from river import cluster, preprocessing, stream
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import silhouette_score
-from sklearn.cluster import KMeans # Importar KMeans
+from sklearn.cluster import KMeans as SKKMeans  # solo si quisieras comparar (opcional)
+from river import compose
+# -------------------------------
+# Configuración
+csv_path = "data/adult.csv"   # Ajusta si tu CSV está en otra ruta
+sample_size = None           # set None para usar todo (puede tardar mucho)
+n_clusters = 2
+random_state = 1
+# -------------------------------
 
-# --- 1. CARGA Y PREPARACIÓN DE DATOS ---
-df = pd.read_csv('data/adult.csv')
+# --- 1) Cargar (y muestrear para eficiencia si se desea) ---
+df_full = pd.read_csv(csv_path)
 
-# Definir la columna objetivo (income)
-y_target = df['income']
+if sample_size is not None:
+    df = df_full.sample(n=sample_size, random_state=random_state).reset_index(drop=True)
+else:
+    df = df_full.copy()
 
-# Eliminar la columna objetivo 'income' de las características
-X = df.drop(columns=['income'])
+# Guardamos income para análisis posterior (no se usa para entrenamiento del cluster)
+y_income = df['income'].astype(str).reset_index(drop=True)
 
-# -------------------------------------------------------------
-# --- 2. PRE-PROCESAMIENTO: ONE-HOT ENCODING (Manejo de Categóricas) ---
-categorical_cols = X.select_dtypes(include=['object']).columns
-X = pd.get_dummies(X, columns=categorical_cols, drop_first=True)
+# Características (sin la etiqueta)
+X_df = df.drop(columns=['income'])
 
-# -------------------------------------------------------------
-# --- 3. ESCALADO DE DATOS ---
+# --- 2) Crear flujo (generador) que emula llegada fila a fila ---
+# Convertimos cada fila a dict (River espera dicts)
+data_stream = (row.dropna().to_dict() for _, row in X_df.iterrows())
+
+# --- 3) Definir pipeline incremental de River:
+# Primero OneHotEncoder (categorías -> numérico), luego StandardScaler y KMeans incremental
+model = (
+    #compose.Discard('capital.loss','capital.gain', 'hours.per.week','age') 
+    preprocessing.OneHotEncoder() |
+    preprocessing.StandardScaler() |
+    cluster.KMeans(n_clusters=2, sigma=0.5, halflife=2, seed=42)
+    #cluster.DBSTREAM(clustering_threshold=0.005, minimum_weight=4, fading_factor= 0.05)
+)
+
+# --- 4) Bucle streaming: predecir asignación, guardar y aprender (in-place) ---
+assignments = []  # guarda ID del clúster por instancia
+
+for i, (x_dict) in enumerate(data_stream, start=1):
+    # predict_one puede devolver None si el modelo aún no tiene centroides inicializados
+    cluster_id = model.predict_one(x_dict)
+    if cluster_id is None:
+        # asignamos -1 mientras no haya clusters definidos
+        assignments.append(-1)
+    else:
+        assignments.append(cluster_id)
+    # aprender in-place (IMPORTANTE: no reasignar model = model.learn_one(...))
+    model.learn_one(x_dict)
+    # opcional: progreso
+    if i % 1000 == 0:
+        print(f"Procesadas {i} instancias...")
+
+print("Entrenamiento incremental finalizado. Instancias procesadas:", len(assignments))
+#print(model['KMeans'].centers)
+
+# --- 5) Post-procesado para evaluación/visualización (batch sobre la muestra usada) ---
+# Reproducimos el mismo preprocesado que hizo River para obtener la matriz numérica
+# (Usamos pandas.get_dummies + StandardScaler para evaluación/silhouette/PCA)
+X_batch_encoded = pd.get_dummies(X_df, drop_first=True)
 scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-X_scaled_df = pd.DataFrame(X_scaled, columns=X.columns)
+X_batch_scaled = scaler.fit_transform(X_batch_encoded.values)
 
-# Convertir el array escalado a lista de etiquetas para compatibilidad con la estructura anterior
-X_scaled_array = X_scaled_df.values 
+# Para las instancias iniciales asignadas a -1 (mientras no había clusters), 
+# podemos volver a asignarlas usando el KMeans final de sklearn entrenado con los mismos centroids
+# pero en muchos casos no es necesario; para silhouette debemos tener etiquetas válidas.
+# Si hay -1, reasignamos usando los centroides del modelo River (si accesibles) o usando sklearn KMeans fit.
+if any([a == -1 for a in assignments]):
+    # Reajustamos un KMeans sklearn con las mismas n_clusters sobre la representación batch
+    km_refit = SKKMeans(n_clusters=n_clusters, random_state=random_state, n_init=10)
+    km_refit.fit(X_batch_scaled)
+    assignments = km_refit.labels_.tolist()
+    print("Se reasignaron clusters usando KMeans (batch) para obtener etiquetas completas.")
+else:
+    # assignments ya tiene ids válidos
+    assignments = np.array(assignments)
 
-# -------------------------------------------------------------
-# --- 4. CLUSTERING CON K-MEANS (K=2) ---
+# --- 6) Métrica: Silhouette (requiere >1 clusters y etiquetas válidas) ---
+# if n_clusters > 1:
+#     silhouette_avg = silhouette_score(X_batch_scaled, assignments)
+# else:
+#     silhouette_avg = float('nan')
 
-# Inicializar y entrenar el modelo KMeans con K=2
-kmeans = KMeans(n_clusters=2, random_state=42, n_init=10) # n_init=10 para asegurar convergencia
-kmeans.fit(X_scaled_array)
+# print(f"\nSilhouette Score (muestra): {silhouette_avg:.4f}")
 
-# Obtener las etiquetas de cluster
-cluster_labels = kmeans.labels_ # KMeans ya proporciona las etiquetas como un array
-
-# -------------------------------------------------------------
-# --- 5. PCA PARA VISUALIZACIÓN ---
-
-pca = PCA(n_components=2)
-X_pca = pca.fit_transform(X_scaled_array)
-X_pca_df = pd.DataFrame(X_pca, columns=['PC1', 'PC2'])
-X_pca_df['Cluster'] = cluster_labels
-
-# -------------------------------------------------------------
-# --- 6. COMBINAR DATOS PARA MÉTRICAS Y GRÁFICOS ---
-
-# Crear un DataFrame único con etiquetas de cluster y la variable objetivo
-results_df = pd.DataFrame({
-    'Cluster': cluster_labels,
-    'Income': y_target
+# --- 7) Preparar DataFrame para gráficas (PCA) ---
+pca = PCA(n_components=2, random_state=random_state)
+X_pca = pca.fit_transform(X_batch_scaled)
+plot_df = pd.DataFrame({
+    "PC1": X_pca[:, 0],
+    "PC2": X_pca[:, 1],
+    "Cluster": assignments.astype(str),
+    "Income": y_income.values
 })
 
-# -------------------------------------------------------------
-# --- 7. IMPRESIÓN DE MÉTRICAS GENERALES ---
-
-# 7.1. Número de Clusters (K=2, sin ruido)
-n_clusters = 2
-print(f"\n=======================================================")
-print(f"|               MÉTRICAS DE CLUSTERING                |")
-print(f"=======================================================")
-print(f"| Número total de Clusters encontrados: {n_clusters:<15}|")
-print(f"=======================================================")
-
-# 7.2. Distribución de Instancias por Cluster
-print("\nDistribución de Instancias por Cluster:")
-cluster_distribution = results_df['Cluster'].value_counts().sort_index()
-cluster_distribution.index = cluster_distribution.index.map(lambda x: f"Cluster {x}")
-print(cluster_distribution.to_string())
-
-# 7.3. Métrica de Silhouette Score
-# K-Means siempre produce etiquetas, por lo que el cálculo es directo
-if n_clusters > 1:
-    silhouette_avg = silhouette_score(X_scaled_array, cluster_labels)
-    print(f"\nSilhouette Score: {silhouette_avg:.4f}")
-else:
-    print("\nSilhouette Score: No se pudo calcular (solo un clúster).")
-
-# -------------------------------------------------------------
-# --- 8. GRÁFICO DE BARRAS (Distribución de 'income' por Clúster) ---
-
-plot_df = results_df.copy()
-plot_df['Cluster_Str'] = plot_df['Cluster'].astype(str)
-
+# --- 8) Gráfico: distribución de income por clúster ---
 plt.figure(figsize=(10, 6))
-sns.countplot(
-    data=plot_df, 
-    x='Cluster_Str', 
-    hue='Income', 
-    palette='viridis'
-)
-
-# Configuración del gráfico de barras
-plt.title('Distribución de Ingresos ("income") por Clúster (K-Means, K=2)')
+sns.countplot(data=plot_df, x='Cluster', hue='Income', palette='viridis')
+plt.title('Distribución de Ingresos ("income") por Clúster (KMeans incremental)')
 plt.xlabel('ID del Clúster')
 plt.ylabel('Conteo de Instancias')
-plt.legend(title='Ingreso')
-plt.grid(axis='y', linestyle='--')
+plt.legend(title='Income')
+plt.grid(axis='y', linestyle='--', alpha=0.4)
 plt.tight_layout()
 plt.show()
 
-# -------------------------------------------------------------
-# --- 9. PLOTEO DE PCA ---
-
-X_pca_df['Cluster_Str'] = X_pca_df['Cluster'].astype(str)
-
+# --- 9) Gráfico PCA coloreado por clúster ---
 plt.figure(figsize=(12, 8))
-sns.scatterplot(
-    x='PC1',
-    y='PC2',
-    data=X_pca_df,
-    hue='Cluster_Str',
-    palette='Set1', # Usamos Set1 para dos colores claros
-    s=25,
-    alpha=0.7,
-    legend='full'
-)
-
-# Configuración del gráfico
-plt.title(f'K-Means Clustering (K=2) en Adult Dataset (PCA Reducido)')
-plt.xlabel(f'Componente Principal 1 ({pca.explained_variance_ratio_[0]*100:.2f}%)')
-plt.ylabel(f'Componente Principal 2 ({pca.explained_variance_ratio_[1]*100:.2f}%)')
-
-plt.legend(title='ID del Clúster')
-plt.grid(True)
+sns.scatterplot(data=plot_df, x='PC1', y='PC2', hue='Cluster', palette='Set1', s=20, alpha=0.7)
+plt.title('Proyección PCA de clústeres (KMeans incremental en muestra)')
+plt.xlabel(f'PC1 ({pca.explained_variance_ratio_[0]*100:.2f}%)')
+plt.ylabel(f'PC2 ({pca.explained_variance_ratio_[1]*100:.2f}%)')
+plt.legend(title='Cluster')
+plt.grid(True, alpha=0.3)
 plt.tight_layout()
 plt.show()
+
+# --- 10) Mostrar tabla de distribución por cluster e income ---
+results_df = pd.DataFrame({
+    'Cluster': assignments,
+    'Income': y_income.values
+})
+print("\nDistribución de instancias por clúster (con proporciones por income):")
+for cid in sorted(np.unique(assignments)):
+    sub = results_df[results_df['Cluster'] == cid]
+    counts = sub['Income'].value_counts(normalize=True).round(3)
+    print(f"\nCluster {cid} (N={len(sub)}):")
+    print(counts.to_string())
